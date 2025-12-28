@@ -39,7 +39,7 @@ if not GEMINI_API_KEY:
     print("❌ ERROR: ไม่พบ GEMINI_API_KEY")
     sys.exit(1)
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-1.5-flash"
 
 # ------------------------------
 # UTILS
