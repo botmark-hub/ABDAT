@@ -134,20 +134,15 @@ def detect_intent(user_text: str) -> str:
     """
     intent_prompt = f"""
 คุณคือตัวตรวจจับเจตนา (Intent Detection)
-
 ข้อความจากผู้ใช้:
 "{user_text}"
-
 ให้ตอบเพียง 1 คำจากลิสต์:
 - start_phq9    (เมื่อผู้ใช้ต้องการเริ่มทำแบบประเมิน PHQ-9 ไม่ว่าจะใช้คำพูดแบบไหน)
 - general       (เมื่อผู้ใช้ไม่ได้ต้องการเริ่ม PHQ-9)
-
 ตอบเฉพาะคำเดียวเท่านั้น ห้ามตอบอย่างอื่นเด็ดขาด
     """
-
     reply = gemini_reply(intent_prompt)
     reply = reply.replace("\n", "").strip()
-
     if reply not in ["start_phq9", "general"]:
         return "general"
     return reply
@@ -252,45 +247,35 @@ def safety_override(user_text: str) -> int | None:
         "ทำร้ายตัวเอง", "สิ้นหวังมาก", "อยากหายไป", "ไม่เห็นคุณค่า",
         "จะฆ่าตัวเอง", "ไม่อยากมีชีวิต"
     ]
-
     for word in danger_keywords:
         if word in user_text:
             return 3   # ระดับสูงสุด
-
     return None
 
 def classify_phq9_answer(answer_text: str) -> int:
     """
     วิเคราะห์คำตอบ PHQ-9 แบบปลอดภัย (Hybrid: Rule-based + LLM)
     """
-
     # 1) RULE-BASED SAFETY
     danger_score = safety_override(answer_text)
     if danger_score is not None:
         return danger_score
-
     # 2) LLM CLASSIFICATION
     prompt = f"""
 คุณคือนักจิตวิทยาที่ทำแบบประเมิน PHQ-9
-
 ข้อความจากผู้ใช้:
 "{answer_text}"
-
 ให้เลือกคำตอบที่ตรงที่สุด:
 0 = ไม่เลย
 1 = หลายวัน
 2 = บ่อยกว่า 50% ของวัน
 3 = เกือบทุกวัน
-
 ตอบเป็นตัวเลขเท่านั้น (0,1,2หรือ3) ห้ามมีคำอธิบาย
     """
-
     reply = gemini_reply(prompt).strip()
-
     # ป้องกัน LLM ตอบผิด
     if reply not in ["0", "1", "2", "3"]:
         return 0
-
     return int(reply)
 
 # ------------------------------
