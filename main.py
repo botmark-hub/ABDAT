@@ -14,7 +14,8 @@ from gtts import gTTS
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from fer import FER
-import google.generativeai as genai
+from google import genai
+
 
 # ------------------------------
 # GLOBAL
@@ -22,7 +23,7 @@ import google.generativeai as genai
 last_phq9_score = None
 last_phq9_result = None
 last_question = None
-CABLE_INPUT_INDEX = 11
+CABLE_INPUT_INDEX = 13
 LOG_FILE = "phq9_log.txt"
 conversation_history = []
 DEBUG = True
@@ -37,9 +38,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     print("❌ ERROR: ไม่พบ GEMINI_API_KEY")
     sys.exit(1)
-genai.configure(api_key=GEMINI_API_KEY)
-GEN_MODEL = "gemini-1.5-flash"
-model = genai.GenerativeModel(GEN_MODEL)
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_NAME = "gemini-2.0-flash"
 
 # ------------------------------
 # UTILS
@@ -98,31 +98,45 @@ def speech_to_text(recognizer: sr.Recognizer, mic: sr.Microphone):
 # ------------------------------
 # GEMINI REPLY
 # ------------------------------
+MAX_HISTORY = 3
+
 def gemini_reply(prompt: str, persona: str = "") -> str:
     try:
-        full_conversation = ""
-        for c in conversation_history:
-            full_conversation += f"{c['role']}: {c['text']}\n"
-        full_conversation += f"user: {prompt}\n"
+        recent_history = conversation_history[-MAX_HISTORY:]
+
+        context = ""
+        for c in recent_history:
+            context += f"{c['role']}: {c['text']}\n"
 
         full_prompt = (
             f"{persona}\n"
-            "ให้ตอบโดยใช้บริบทบทสนทนาก่อนหน้าด้านล่างนี้:\n"
-            f"{full_conversation}\n"
-            "ตอบสั้น กระชับ ไม่เกิน 5 บรรทัด"
+            f"{context}"
+            f"user: {prompt}\n"
+            "ตอบสั้น กระชับ"
         )
 
-        response = model.generate_content(safe_text(full_prompt))
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=full_prompt,
+            config={
+                "temperature": 0.2,
+                "max_output_tokens": 120,
+            }
+        )
+
         reply_text = response.text.strip()
 
-        conversation_history.append({"role": "assistant", "text": reply_text})
-        log(f"อลิษา: {reply_text}")
+        conversation_history.append({
+            "role": "assistant",
+            "text": reply_text[:300]
+        })
+
         return reply_text
 
     except Exception as e:
         log(f"Gemini Error: {e}")
-        return "ไม่สามารถประมวลผลได้ค่ะ"
-    
+        return "ขออภัยค่ะ ระบบประมวลผลขัดข้องชั่วคราว"
+
 # ------------------------------
 # INTENT DETECTION
 # ------------------------------
