@@ -14,7 +14,7 @@ from gtts import gTTS
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from fer import FER
-from google import genai
+from openai import OpenAI
 
 
 # ------------------------------
@@ -23,7 +23,7 @@ from google import genai
 last_phq9_score = None
 last_phq9_result = None
 last_question = None
-CABLE_INPUT_INDEX = 13
+CABLE_INPUT_INDEX = 14
 LOG_FILE = "phq9_log.txt"
 conversation_history = []
 DEBUG = True
@@ -34,12 +34,13 @@ shared_state = {"emotion": "neutral", "face_detected": False, "last_seen": time.
 # LOAD CONFIG
 # ------------------------------
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("❌ ERROR: ไม่พบ GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    print("❌ ERROR: ไม่พบ OPENAI_API_KEY")
     sys.exit(1)
-client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-1.5-flash"
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # ------------------------------
 # UTILS
@@ -96,7 +97,7 @@ def speech_to_text(recognizer: sr.Recognizer, mic: sr.Microphone):
         return None
 
 # ------------------------------
-# GEMINI REPLY
+# OPENAI REPLY
 # ------------------------------
 MAX_HISTORY = 3
 
@@ -104,27 +105,29 @@ def gemini_reply(prompt: str, persona: str = "") -> str:
     try:
         recent_history = conversation_history[-MAX_HISTORY:]
 
-        context = ""
-        for c in recent_history:
-            context += f"{c['role']}: {c['text']}\n"
-
-        full_prompt = (
-            f"{persona}\n"
-            f"{context}"
-            f"user: {prompt}\n"
-            "ตอบสั้น กระชับ"
-        )
-
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=full_prompt,
-            config={
-                "temperature": 0.2,
-                "max_output_tokens": 120,
+        messages = [
+            {
+                "role": "system",
+                "content": persona if persona else "You are Alisa, a kind Thai AI assistant."
             }
+        ]
+
+        for c in recent_history:
+            messages.append({
+                "role": "assistant" if c["role"] == "assistant" else "user",
+                "content": c["text"]
+            })
+
+        messages.append({"role": "user", "content": prompt})
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.2,
+            max_tokens=200
         )
 
-        reply_text = response.text.strip()
+        reply_text = response.choices[0].message.content.strip()
 
         conversation_history.append({
             "role": "assistant",
@@ -134,7 +137,7 @@ def gemini_reply(prompt: str, persona: str = "") -> str:
         return reply_text
 
     except Exception as e:
-        log(f"Gemini Error: {e}")
+        log(f"ChatGPT Error: {e}")
         return "ขออภัยค่ะ ระบบประมวลผลขัดข้องชั่วคราว"
 
 # ------------------------------
