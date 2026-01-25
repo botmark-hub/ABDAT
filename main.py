@@ -1,391 +1,180 @@
 import os
 import sys
 import time
+import re
 import unicodedata
 import threading
-from collections import Counter
 from io import BytesIO
 
 import cv2
 import numpy as np
 import sounddevice as sd
-import speech_recognition as sr
+import soundfile as sf
 from gtts import gTTS
 from pydub import AudioSegment
-from dotenv import load_dotenv
 from fer import FER
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
+# --- CONFIG ---
+MY_KEY = "AIzaSyCFDro1aHHN1Q-RptrWlO7-eBx5vY7uDAI" 
+CABLE_INPUT_INDEX = 14 
+OBS_TEXT_FILE = "alisa_obs.txt"
+MODEL_ID = "gemini-2.0-flash"
+SAMPLE_RATE = 16000 
 
-# ------------------------------
-# GLOBAL
-# ------------------------------
-last_phq9_score = None
-last_phq9_result = None
-last_question = None
-CABLE_INPUT_INDEX = 14
-LOG_FILE = "phq9_log.txt"
-conversation_history = []
-DEBUG = True
+client = genai.Client(api_key=MY_KEY, http_options={'api_version': 'v1'})
+shared_state = {"emotion": "neutral"}
 
-shared_state = {"emotion": "neutral", "face_detected": False, "last_seen": time.time()}
-
-# ------------------------------
-# LOAD CONFIG
-# ------------------------------
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    print("❌ ERROR: ไม่พบ OPENAI_API_KEY")
-    sys.exit(1)
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# ------------------------------
-# UTILS
-# ------------------------------
-def log(msg: str):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    if DEBUG:
-        print(f"[{timestamp}] {msg}")
-
-def safe_text(text: str) -> str:
-    normalized = unicodedata.normalize('NFC', text)
-    return normalized.encode('utf-8', errors='ignore').decode('utf-8')
-
-def check_audio_output(device_index: int):
+def text_to_speech(text: str):
+    clean_text = re.sub(r'\[.*?\]', '', text).strip()
+    if not clean_text: return
+    print(f"🤖 อลิษา: {clean_text}")
     try:
-        devices = sd.query_devices()
-        if device_index >= len(devices) or devices[device_index]['max_output_channels'] == 0:
-            log(f"❌ ERROR: ไม่พบอุปกรณ์เสียง index {device_index}")
-            sys.exit(1)
-        else:
-            log(f"✅ พบอุปกรณ์เสียง index {device_index}: {devices[device_index]['name']}")
-    except Exception as e:
-        log(f"❌ ERROR ตรวจสอบอุปกรณ์เสียง: {e}")
-        sys.exit(1)
-
-def text_to_speech(text: str, device_index: int = CABLE_INPUT_INDEX):
-    log(f"🤖 อลิษาพูดว่า: {text}")
-    try:
-        tts = gTTS(text=safe_text(text), lang="th")
+        with open(OBS_TEXT_FILE, "w", encoding="utf-8") as f:
+            f.write(clean_text)
+        tts = gTTS(text=unicodedata.normalize("NFC", clean_text), lang="th")
         mp3_fp = BytesIO()
         tts.write_to_fp(mp3_fp)
         mp3_fp.seek(0)
         audio = AudioSegment.from_file(mp3_fp, format="mp3")
         samples = np.array(audio.get_array_of_samples())
-        sd.play(samples, samplerate=audio.frame_rate, device=device_index)
+        sd.play(samples, samplerate=audio.frame_rate, device=CABLE_INPUT_INDEX)
         sd.wait()
-    except Exception as e:
-        log(f"TTS Error: {e}")
+    except: pass
 
-def speech_to_text(recognizer: sr.Recognizer, mic: sr.Microphone):
-    with mic as source:
-        recognizer.adjust_for_ambient_noise(source)
-        try:
-            audio = recognizer.listen(source, timeout=5)
-        except sr.WaitTimeoutError:
-            log("🗣️ ผู้ใช้: (ไม่ได้พูด/ไม่จับเสียง)")
-            return None
-    try:
-        text = recognizer.recognize_google(audio, language="th-TH")
-        log(f"🗣️ ผู้ใช้พูดว่า: {text}")
-        return text
-    except Exception as e:
-        log(f"🗣️ ผู้ใช้: (ฟังไม่ชัด) Error: {e}")
-        return None
-
-# ------------------------------
-# OPENAI REPLY
-# ------------------------------
-MAX_HISTORY = 3
-
-def gemini_reply(prompt: str, persona: str = "") -> str:
-    try:
-        recent_history = conversation_history[-MAX_HISTORY:]
-
-        messages = [
-            {
-                "role": "system",
-                "content": persona if persona else "You are Alisa, a kind Thai AI assistant."
-            }
-        ]
-
-        for c in recent_history:
-            messages.append({
-                "role": "assistant" if c["role"] == "assistant" else "user",
-                "content": c["text"]
-            })
-
-        messages.append({"role": "user", "content": prompt})
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.2,
-            max_tokens=200
-        )
-
-        reply_text = response.choices[0].message.content.strip()
-
-        conversation_history.append({
-            "role": "assistant",
-            "text": reply_text[:300]
-        })
-
-        return reply_text
-
-    except Exception as e:
-        log(f"ChatGPT Error: {e}")
-        return "ขออภัยค่ะ ระบบประมวลผลขัดข้องชั่วคราว"
-
-# ------------------------------
-# INTENT DETECTION
-# ------------------------------
-def detect_intent(user_text: str) -> str:
-    """
-    ให้ Gemini วิเคราะห์ว่า user ต้องการอะไร:
-    - start_phq9   → ต้องการเริ่มแบบประเมิน
-    - general      → พูดคุยทั่วไป
-    """
-    intent_prompt = f"""
-คุณคือตัวตรวจจับเจตนา (Intent Detection)
-ข้อความจากผู้ใช้:
-"{user_text}"
-ให้ตอบเพียง 1 คำจากลิสต์:
-- start_phq9    (เมื่อผู้ใช้ต้องการเริ่มทำแบบประเมิน PHQ-9 ไม่ว่าจะใช้คำพูดแบบไหน)
-- general       (เมื่อผู้ใช้ไม่ได้ต้องการเริ่ม PHQ-9)
-ตอบเฉพาะคำเดียวเท่านั้น ห้ามตอบอย่างอื่นเด็ดขาด
-    """
-    reply = gemini_reply(intent_prompt)
-    reply = reply.replace("\n", "").strip()
-    if reply not in ["start_phq9", "general"]:
-        return "general"
-    return reply
-
-# ------------------------------
-# PHQ9 SYSTEM
-# ------------------------------
-PHQ9_QUESTIONS = [
-    "ในช่วง 2 สัปดาห์ที่ผ่านมา คุณรู้สึกไม่สนใจหรือไม่อยากทำอะไรบ่อยแค่ไหนคะ?",
-    "รู้สึกเศร้าหม่นหมองหรือท้อแท้บ่อยแค่ไหนคะ?",
-    "มีปัญหาเรื่องการนอน เช่น นอนไม่หลับหรือนอนมากเกินไปไหมคะ?",
-    "รู้สึกเหนื่อยง่ายหรือไม่ค่อยมีแรงบ่อยแค่ไหนคะ?",
-    "รู้สึกเบื่ออาหารหรือกินมากเกินไปไหมคะ?",
-    "รู้สึกไม่ดีกับตัวเอง หรือคิดว่าตัวเองล้มเหลวบ่อยแค่ไหนคะ?",
-    "มีปัญหาสมาธิ เช่น สมาธิสั้นลงไหมคะ?",
-    "เคลื่อนไหวช้าลง พูดช้าลง หรือทำอะไรเร็วขึ้นเพราะความกระสับกระส่ายไหมคะ?",
-    "คิดทำร้ายตัวเองหรือคิดว่าตายไปซะจะดีกว่าไหมคะ?",
-]
-
-CHOICE_MAP = {"ไม่เลย":0, "หลายวัน":1, "บ่อย":2, "เกือบทุกวัน":3}
-
-def classify_phq9(score: int) -> str:
-    if score <= 4: return "ไม่มีภาวะซึมเศร้า"
-    elif score <= 9: return "มีภาวะซึมเศร้าเล็กน้อย"
-    elif score <= 14: return "ภาวะซึมเศร้าปานกลาง"
-    elif score <= 19: return "ภาวะซึมเศร้ารุนแรง"
-    else: return "ภาวะซึมเศร้ารุนแรงมาก"
-
-def recommendation(result: str) -> str:
-    if result in ["ภาวะซึมเศร้ารุนแรง","ภาวะซึมเศร้ารุนแรงมาก"]:
-        return "ระดับค่อนข้างสูงค่ะ ควรพบแพทย์หรือผู้เชี่ยวชาญด้านสุขภาพจิต หากมีความคิดทำร้ายตัวเอง ติดต่อสายด่วน 1323 ทันที"
-    else:
-        return "อยู่ในระดับที่ยังไม่รุนแรงมาก พักผ่อนให้เพียงพอ พูดคุยกับคนใกล้ชิด หากอาการยังอยู่ควรปรึกษาผู้เชี่ยวชาญค่ะ"
-
-def run_phq9_ai(recognizer: sr.Recognizer, mic: sr.Microphone):
-    global last_phq9_score, last_phq9_result, last_question
-    total_score = 0
-
-    text_to_speech("เราจะทำแบบประเมิน PHQ9 ทั้งหมด 9 ข้อนะคะ ตอบตามจริงได้เลยค่ะ")
-
-    time.sleep(1)
-
-    for q in PHQ9_QUESTIONS:
-        last_question = q
+def listen_and_record():
+    threshold = 0.012
+    silence_limit = 1.8
+    recording = []
+    is_speaking = False
+    silent_frames = 0
+    
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1) as stream:
+        print("👂 ฟังอยู่...")
         while True:
-            text_to_speech(q)
-            ans = speech_to_text(recognizer, mic)
-            if not ans:
-                text_to_speech("ไม่ได้ยินค่ะ ลองตอบอีกครั้งนะคะ")
+            data, overflowed = stream.read(1024)
+            volume = np.linalg.norm(data) / np.sqrt(len(data))
+            if volume > threshold:
+                if not is_speaking: is_speaking = True
+                silent_frames = 0
+            elif is_speaking:
+                silent_frames += 1024 / SAMPLE_RATE
+            if is_speaking:
+                recording.append(data.copy())
+                if silent_frames > silence_limit: break
+    
+    if not recording: return None
+    audio_data = np.concatenate(recording, axis=0)
+    buffer = BytesIO()
+    sf.write(buffer, audio_data, SAMPLE_RATE, format='WAV')
+    return buffer.getvalue()
+
+def run_phq9_assessment():
+    questions = [
+        "เบื่อ หรือไม่สนใจอยากทำอะไรเลยไหมคะ?", "รู้สึกไม่สบายใจ เศร้า หรือท้อแท้ไหมคะ?",
+        "หลับยาก หรือหลับมากเกินไปไหมคะ?", "เหนื่อยง่าย หรือไม่ค่อยมีแรงไหมคะ?",
+        "เบื่ออาหาร หรือกินมากเกินไปไหมคะ?", "รู้สึกไม่ดีกับตัวเอง หรือล้มเหลวไหมคะ?",
+        "สมาธิไม่ดีเวลาอ่านหนังสือหรือดูทีวีไหมคะ?", "พูดหรือทำอะไรช้าลง หรือกระสับกระส่ายไหมคะ?",
+        "คิดทำร้ายตัวเอง หรือคิดว่าตายไปจะดีกว่าไหมคะ?"
+    ]
+    total_score = 0
+    q9_score = 0 # แยกคะแนนข้อ 9 ไว้ตรวจสอบความปลอดภัย
+    
+    text_to_speech("อลิษาขอเริ่มการประเมินเบื้องต้นนะคะ เล่าความรู้สึกให้ฟังได้เต็มที่เลยค่ะ")
+    
+    for i, q in enumerate(questions):
+        text_to_speech(f"ข้อ {i+1}: {q}")
+        answered = False
+        while not answered:
+            audio_bytes = listen_and_record()
+            if not audio_bytes: continue
+            
+            prompt = (
+                f"คำถาม: '{q}'\n"
+                "วิเคราะห์เสียงตอบ:\n"
+                "1. ถอดความใส่ [USER_SAID:...]\n"
+                "2. ให้คะแนน 0-3 ใส่ [SCORE:ตัวเลข]\n"
+                "3. ตอบกลับด้วยความเห็นอกเห็นใจ (ถ้าเป็นข้อ 9 และคะแนน > 0 ต้องปลอบโยนเป็นพิเศษและแสดงความห่วงใยทันที)"
+            )
+            
+            try:
+                res = client.models.generate_content(
+                    model=MODEL_ID,
+                    contents=[types.Part.from_text(text=prompt), types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")]
+                )
+                reply = res.text.strip()
+                
+                user_match = re.search(r'\[USER_SAID:(.*?)\]', reply)
+                if user_match: print(f"🗣️ คุณพูดว่า: {user_match.group(1).strip()}")
+
+                score_match = re.search(r'\[SCORE:(\d)\]', reply)
+                if score_match:
+                    current_score = int(score_match.group(1))
+                    total_score += current_score
+                    if i == 8: q9_score = current_score # เก็บคะแนนข้อ 9
+                    
+                    text_to_speech(reply)
+                    answered = True
+                else:
+                    text_to_speech("อลิษารับรู้นะคะ แต่ขอชัดๆ อีกนิดว่าความรู้สึกนี้เกิดขึ้นบ่อยไหมคะ?")
+            except:
+                text_to_speech("ขออภัยค่ะ ระบบขัดข้องนิดหน่อย รบกวนเล่าใหม่อีกทีนะ")
+
+    # --- ส่วนสรุปผล (ปรับปรุงตามคะแนนข้อ 9) ---
+    text_to_speech(f"ขอบคุณที่ไว้วางใจเล่าให้ฟังนะคะ คะแนนรวมของคุณคือ {total_score} คะแนน")
+    
+    if q9_score > 0:
+        # หากข้อ 9 มีคะแนน (มีความคิดอยากทำร้ายตัวเอง) ให้เข้าโหมดดูแลด่วน
+        crisis_msg = (
+            "อลิษาเป็นห่วงคุณมากนะคะ ความรู้สึกเหนื่อยจนอยากพักไปตลอดมันหนักหนามาก "
+            "แต่อยากให้รู้ว่าคุณไม่ต้องเผชิญเรื่องนี้คนเดียวนะคะ อลิษาอยากให้คุณลองหาที่ปรึกษา "
+            "หรือโทรสายด่วนสุขภาพจิต 1 3 2 3 จะมีเจ้าหน้าที่คอยรับฟังคุณตลอด 2 4 ชั่วโมงเลยค่ะ "
+            "กอดแน่นๆ นะคะ คุณเก่งมากแล้วที่ผ่านวันนี้มาได้"
+        )
+        text_to_speech(crisis_msg)
+    elif total_score >= 9:
+        text_to_speech("ผลประเมินอยู่ในเกณฑ์เสี่ยง อลิษาแนะนำให้ลองหาเวลาพักผ่อนหรือปรึกษาผู้เชี่ยวชาญเพื่อดูแลใจนะคะ")
+    else:
+        text_to_speech("คุณยังดูเข้มแข็งดีค่ะ อย่าลืมหาเวลาทำสิ่งที่ชอบเพื่อผ่อนคลายด้วยนะคะ")
+    
+if __name__ == "__main__":
+    # (Thread FER สำหรับวิเคราะห์อารมณ์ใบหน้า...)
+    text_to_speech("สวัสดีค่ะ อลิษามาแล้ว วันนี้อยากคุยเล่นหรืออยากให้ช่วยประเมินสุขภาพจิตดีคะ?")
+
+    while True:
+        audio_bytes = listen_and_record()
+        if not audio_bytes: continue
+        
+        instruction = (
+            f"คุณคืออลิษา AI ที่ปรึกษา (อารมณ์ผู้ใช้: {shared_state['emotion']})\n"
+            "กฎการทำงาน:\n"
+            "1. ถอดความคำพูดผู้ใช้ใส่ใน [USER_SAID:...]\n"
+            "2. หากผู้ใช้ต้องการ 'เริ่ม' ทำแบบประเมินสุขภาพจิตจริงๆ ให้ใส่แท็ก [PHQ9] มาในคำตอบ\n"
+            "3. หากผู้ใช้ขอให้เล่าเรื่องตลก คุยเล่น หรือถามคำถามทั่วไป ห้ามใส่ [PHQ9] เด็ดขาด\n"
+            "4. ตอบโต้ด้วยความเป็นกันเองและเห็นอกเห็นใจ"
+        )
+        
+        try:
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=[
+                    types.Part.from_text(text=instruction),
+                    types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+                ]
+            )
+            reply = response.text.strip()
+            
+            user_speech = re.search(r'\[USER_SAID:(.*?)\]', reply)
+            if user_speech:
+                print(f"🗣️ คุณพูดว่า: {user_speech.group(1).strip()}")
+
+            if "[PHQ9]" in reply:
+                text_to_speech("ได้เลยค่ะ เดี๋ยวอลิษาพาทำแบบประเมินนะคะ")
+                run_phq9_assessment()
                 continue
 
-            # ----- NEW PROMPT HERE -----
-            prompt_ai = f"""
-ผู้ใช้ตอบว่า: '{ans}'
-
-โปรดประเมินคำตอบนี้ว่าเข้ากับคำตอบใดมากที่สุดของแบบประเมิน PHQ-9:
-
-ตัวเลือก:
-- ไม่เลย (0)
-- หลายวัน (1)
-- บ่อย (2)
-- เกือบทุกวัน (3)
-
-ให้ตอบเพียงหนึ่งคำต่อไปนี้เท่านั้น:
-ไม่เลย, หลายวัน, บ่อย, เกือบทุกวัน
-
-ตัวอย่าง:
-- "นอนไม่ค่อยหลับสองสามครั้ง" → หลายวัน
-- "แทบทุกวันเลย เหนื่อยมาก" → เกือบทุกวัน
-- "ยังโอเคนะ ไม่ได้รู้สึกอะไร" → ไม่เลย
-- "มีบ้างเป็นบางครั้ง" → หลายวัน
-- "บ่อยมาก ช่วงนี้หนักเลย" → บ่อย
-
-คำตอบของคุณ:
-"""
-
-            ai_choice = gemini_reply(prompt_ai).strip()
-
-            if ai_choice not in CHOICE_MAP:
-                ai_choice = "ไม่เลย"  # fallback ปลอดภัย
-
-            score = CHOICE_MAP[ai_choice]
-            total_score += score
-            log(f"ผู้ใช้ตอบ: {ans} → AI วิเคราะห์เป็น: {ai_choice} (คะแนน {score})")
-            break
-
-    last_phq9_score = total_score
-    last_phq9_result = classify_phq9(total_score)
-
-    summary = f"คุณได้ {last_phq9_score} คะแนน ผลคือ {last_phq9_result}"
-    advice = recommendation(last_phq9_result)
-
-    text_to_speech(summary)
-    text_to_speech(advice)
-
-def safety_override(user_text: str) -> int | None:
-    """
-    ถ้าเจอคำเสี่ยงสูง ให้ Override คะแนนเป็นระดับ 3 ทันที
-    """
-    danger_keywords = [
-        "ฆ่าตัวตาย", "อยากตาย", "ไม่อยากอยู่แล้ว", "จบชีวิต",
-        "ทำร้ายตัวเอง", "สิ้นหวังมาก", "อยากหายไป", "ไม่เห็นคุณค่า",
-        "จะฆ่าตัวเอง", "ไม่อยากมีชีวิต"
-    ]
-    for word in danger_keywords:
-        if word in user_text:
-            return 3   # ระดับสูงสุด
-    return None
-
-def classify_phq9_answer(answer_text: str) -> int:
-    """
-    วิเคราะห์คำตอบ PHQ-9 แบบปลอดภัย (Hybrid: Rule-based + LLM)
-    """
-    # 1) RULE-BASED SAFETY
-    danger_score = safety_override(answer_text)
-    if danger_score is not None:
-        return danger_score
-    # 2) LLM CLASSIFICATION
-    prompt = f"""
-คุณคือนักจิตวิทยาที่ทำแบบประเมิน PHQ-9
-ข้อความจากผู้ใช้:
-"{answer_text}"
-ให้เลือกคำตอบที่ตรงที่สุด:
-0 = ไม่เลย
-1 = หลายวัน
-2 = บ่อยกว่า 50% ของวัน
-3 = เกือบทุกวัน
-ตอบเป็นตัวเลขเท่านั้น (0,1,2หรือ3) ห้ามมีคำอธิบาย
-    """
-    reply = gemini_reply(prompt).strip()
-    # ป้องกัน LLM ตอบผิด
-    if reply not in ["0", "1", "2", "3"]:
-        return 0
-    return int(reply)
-
-# ------------------------------
-# EMOTION CAMERA THREAD
-# ------------------------------
-def emotion_thread():
-    detector = FER(mtcnn=True)
-    cap = cv2.VideoCapture(1)
-
-    if not cap.isOpened():
-        log("❌ ERROR: ไม่สามารถเปิดกล้องได้!")
-        return
-
-    log("✅ กล้องเปิดเรียบร้อย")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            log("❌ ไม่สามารถอ่าน frame จากกล้องได้")
-            continue
-
-        results = detector.detect_emotions(frame)
-        if results:
-            emotions_list = [max(face["emotions"], key=face["emotions"].get) for face in results]
-            emotion_count = Counter(emotions_list)
-            main_emotion = emotion_count.most_common(1)[0][0]
-            shared_state["emotion"] = main_emotion
-            shared_state["face_detected"] = True
-            shared_state["last_seen"] = time.time()
-
-            for face in results:
-                (x, y, w, h) = face["box"]
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,0), 2)
-            cv2.putText(frame, main_emotion, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-
-        else:
-            shared_state["face_detected"] = False
-            cv2.putText(frame, "ไม่พบใบหน้า", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-
-        cv2.imshow("AI Emotion Camera", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-# ------------------------------
-# MAIN LOOP
-# ------------------------------
-if __name__ == "__main__":
-    check_audio_output(CABLE_INPUT_INDEX)
-
-    recognizer = sr.Recognizer()
-    mic = sr.Microphone()
-
-    persona = """คุณคือ “อลิษา” ผู้ช่วย AI แบบเสียง สุภาพ อ่อนโยน และเป็นกันเอง  
-ทำหน้าที่ช่วยประเมิน PHQ-9  
-ตอบสั้น กระชับ ไม่เกิน 5 บรรทัด  
-หากผู้ใช้มีแนวคิดทำร้ายตัวเอง ให้แนะนำติดต่อสายด่วน 1323"""
-
-    threading.Thread(target=emotion_thread, daemon=True).start()
-
-    log("=== อลิษาเริ่มทำงานแล้ว ===")
-    text_to_speech("อลิษาอยู่ตรงนี้ค่ะ เริ่มคุยได้เลยนะคะ")
-
-    while True:
-        user_text = speech_to_text(recognizer, mic)
-        if not user_text:
-            continue
-
-        conversation_history.append({"role": "user", "text": user_text})
-
-        if "ออก" in user_text:
-            text_to_speech("ไว้คุยกันใหม่นะคะ บ๊ายบายค่ะ")
-            conversation_history.clear()
-            last_phq9_score = None
-            last_phq9_result = None
-            last_question = None
-            break
-
-        intent = detect_intent(user_text)
-        if intent == "start_phq9":
-            text_to_speech("ได้เลยค่ะ พร้อมเริ่มทำแบบประเมิน PHQ-9 แล้วนะคะ")
-            run_phq9_ai(recognizer, mic)
-            continue
-
-        if "คะแนน" in user_text and "เท่าไหร่" in user_text:
-            if last_phq9_score is not None:
-                reply = f"คุณได้ {last_phq9_score} คะแนน ผลคือ {last_phq9_result} ค่ะ"
-            else:
-                reply = "ยังไม่มีผลคะแนนค่ะ ต้องทำแบบประเมินก่อนนะคะ"
             text_to_speech(reply)
-            continue
-
-        reply = gemini_reply(user_text, persona)
-        text_to_speech(reply)
+            
+        except Exception as e:
+            print(f"Error: {e}")
