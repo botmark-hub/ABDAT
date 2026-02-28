@@ -43,7 +43,7 @@ CAMERA_HTML = """
 """
 
 # --- 1. CONFIGURATION ---
-MY_KEY = "AIzaSyCzZJxa15ZBs44B3o_OmxGsCyV2kecKIKw" 
+MY_KEY = "YOUR_GEMINI_API" 
 OBS_HOST = "localhost"
 OBS_PORT = 4455
 OBS_PASSWORD = "" 
